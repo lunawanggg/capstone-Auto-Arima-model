@@ -1,0 +1,460 @@
+---
+title: "Auto-Arima Model on Filtered Products with Price Over $50"
+output:
+    html_document: 
+      toc: yes
+      number_sections: yes
+---
+
+```{r,setup,collapse=TRUE,echo=TRUE,message=FALSE,warning=FALSE}
+```
+
+# Load Packages
+
+```{r,results='hide'}
+library(ggplot2);library(ggthemes);library(gridExtra);library(dygraphs) 
+library(quantmod);library(xts);library(zoo) 
+library(fpp); library(fpp2) 
+library(tseries) 
+library(dplyr) 
+library(caret)
+library(forecast)
+library(olsrr)
+library(lubridate)
+library(data.table)
+```
+
+# Load and Clean the Dataset
+
+```{r,warning=FALSE} 
+setwd("D:/RStudio/capstone")
+
+order_2018=read.csv("order_2018.csv",stringsAsFactors = FALSE, encoding = "UTF-8")
+order18=order_2018[,c(2,3,5:8,17:18)]
+str(order18)
+
+order18$Order.Qty=as.numeric(order18$Order.Qty)
+order18$Order.Amount=as.numeric(order18$Order.Amount)
+order18=order18[complete.cases(order18),]
+order18$price=order18$Order.Amount/order18$Order.Qty
+order18[is.na(order18)]=0
+order18=order18[order18$price>=50,]
+names(order18)=c("Transaction_Date","Week_End_Date","Item_Description","Category_Family","Category","Sub_Category","Order_Qty","Order_Amount","Price")
+
+order_2019=read.csv("order_2019.csv",stringsAsFactors = FALSE, encoding = "UTF-8")
+order19=order_2019[,c(2,3,5:8,14:15)]
+str(order19)
+order19$Order.Qty=as.numeric(order19$Order.Qty)
+order19$Order.Amount=as.numeric(order19$Order.Amount)
+order19=order19[complete.cases(order19),]
+order19$price=order19$Order.Amount/order19$Order.Qty
+order19[is.na(order19)]=0
+order19=order19[order19$price>=50,]
+names(order19)=c("Transaction_Date","Week_End_Date","Item_Description","Category_Family","Category","Sub_Category","Order_Qty","Order_Amount","Price")
+
+order=rbind(order18,order19)
+order$Week_End_Date=as.Date(order$Week_End_Date, format='%Y/%m/%d')
+order$Transaction_Date=as.Date(order$Transaction_Date, format='%Y/%m/%d')
+order$Sub_Category=trimws(order$Sub_Category)  # removing blank space
+```
+
+# Select Representative Sub-Categories in Both Year: Sonus, Symphony, SureRide/Titan 65, Pivot with SafeMax
+```{r,warning=FALSE}
+# 1.list of products with average price over $50:
+lists = order %>%
+    group_by(Sub_Category) %>%
+    summarize(avg_price=mean(Price)) %>%
+    arrange(desc(avg_price))
+
+lists
+
+bars1 = ggplot(lists[1:25,],aes(x=reorder(Sub_Category,avg_price),y=avg_price))+ 
+        geom_bar(stat = 'identity',fill="#1380A1")+ 
+        labs(title="Products with Price Over $50",subtitle='--- Top 25',x='Subcategory',y='Average Price')+
+        coord_flip()
+
+bars1 = bars1 + theme(plot.subtitle = element_text(margin=margin(b=20),size = 16, family="Calibri"),
+                plot.title=element_text(size = 20, family="Calibri"),
+                axis.text = element_text(size=14, family="Calibri"), 
+                axis.title.x = element_text(size=16, family="Calibri"), 
+                axis.title.y = element_text(size=16, family="Calibri")) 
+
+labelled.bars1 <- bars1 +
+    geom_label(aes(x = Sub_Category, y = avg_price, label = round(avg_price, 1)),
+               hjust = 1, 
+               vjust = 0.5, 
+               colour = "white", 
+               fill = NA, 
+               label.size = NA, 
+               family="Calibri", 
+               size = 3)
+
+labelled.bars1
+
+bars2 = ggplot(lists[26:54,],aes(x=reorder(Sub_Category,avg_price),y=avg_price))+ 
+        geom_bar(stat = 'identity',fill="#1380A1")+ 
+        labs(title="Products with Price Over $50",subtitle='--- Top 26 to 54',x='Subcategory',y='Average Price')+ coord_flip()
+
+bars2 = bars2 + theme(plot.subtitle = element_text(margin=margin(b=20),size = 16, family="Calibri"),
+                plot.title=element_text(size = 20, family="Calibri"),
+                axis.text = element_text(size=14, family="Calibri"), 
+                axis.title.x = element_text(size=16, family="Calibri"), 
+                axis.title.y = element_text(size=16, family="Calibri")) 
+
+labelled.bars2 <- bars2 +
+    geom_label(aes(x = Sub_Category, y = avg_price, label = round(avg_price, 1)),
+               hjust = 1, 
+               vjust = 0.5, 
+               colour = "white", 
+               fill = NA, 
+               label.size = NA, 
+               family="Calibri", 
+               size = 3)
+
+labelled.bars2
+
+# 2.select subcategories with most complete observations: Sonus, Symphony, SureRide/Titan 65
+sort(table(order18$Sub_Category), decreasing = T)
+sort(table(order19$Sub_Category), decreasing = T)
+
+# 3.select subcategories with distinctive price levels: Pivot with SafeMax, Symphony, Sonus
+lists18 = order18%>%
+    group_by(Sub_Category) %>%
+    summarize(order_qty=sum(Order_Qty),avg_price=mean(Price)) %>%
+    arrange(desc(avg_price))
+
+lists18
+
+lists19 = order19%>%
+    group_by(Sub_Category) %>%
+    summarize(order_qty=sum(Order_Qty),avg_price=mean(Price)) %>%
+    arrange(desc(avg_price))
+
+lists19
+```
+
+# Retrieving Data on Sonus, Symphony, SureRide/Titan 65, Pivot with SafeMax
+```{r,warning=FALSE} 
+sonus=order[order$Sub_Category=='Sonus',]
+symphony=order[order$Sub_Category=='Symphony',]
+sureride=order[order$Sub_Category=='SureRide/Titan 65',]
+pivot=order[order$Sub_Category=='Pivot with SafeMax',]
+```
+
+# Sonus
+
+## Visualize the Historical Sales
+
+```{r,warning=FALSE} 
+days_sonus=summarise(group_by(sonus,sonus$Transaction_Date),order_qty=sum(Order_Qty))
+names(days_sonus)=c("Date","Order")
+
+ts_sonus = xts(days_sonus$Order, days_sonus$Date)
+# General Trend of Historical Sales in 2018 and 2019
+dygraph(ts_sonus,main="Historical Unit Sales of Subcategory Sonus in 2018 and 2019", xlab="Date", ylab="Unit Sales")
+```
+
+## Split Data into Train and Test
+
+### Grouping data into weeks
+```{r} 
+weeks_sonus=summarise(group_by(sonus,sonus$Week_End_Date),order_qty=sum(Order_Qty))
+sales_sonus = ts(data=weeks_sonus$order_qty,start = c(2018,1),end=c(2019,52),frequency = 52)
+sales_sonus
+```
+
+### 70% train, 30% test
+```{r}
+train_sonus=window(sales_sonus,end=c(2019,20))
+test_sonus=window(sales_sonus,start=c(2019,21))
+length(test_sonus)
+length(test_sonus)/length(sales_sonus)
+```
+
+## Fitting model to the training set
+
+```{r} 
+model_sonus_1 = auto.arima(y=train_sonus, stepwise = F, approximation = F, trace = T)
+model_sonus_1
+```
+
+## Obtain predicted values and accuracy
+
+```{r} 
+forecast_1=forecast(model_sonus_1,h=32) # forecasting on test
+accuracy(forecast_1,x=sales_sonus) # accuracy on train and test sets
+```
+
+## Plot predictions against known values
+
+```{r} 
+autoplot(sales_sonus, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_1, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast on Test Set ---- Sonus")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Train the model on the full data and forecast one year into the future
+
+```{r} 
+model_sonus_2 = auto.arima(y = sales_sonus, stepwise = F, approximation = F, trace = T)
+forecast_2=forecast(model_sonus_2,h=52) # forecasting one year into 2020
+```
+
+## Evaluate the Model using MSE and RMSE
+
+```{r} 
+accuracy(forecast_2) # accuracy on train set
+```
+
+## Plot the forecasted values alongside the original data
+
+```{r} 
+autoplot(sales_sonus, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_2, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast into 2020 ---- Sonus")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+# Symphony
+
+## Visualize the Historical Sales
+
+```{r,warning=FALSE} 
+days_symphony=summarise(group_by(symphony,symphony$Transaction_Date),order_qty=sum(Order_Qty))
+names(days_symphony)=c("Date","Order")
+
+ts_symphony = xts(days_symphony$Order, days_symphony$Date)
+# General Trend of Historical Sales in 2018 and 2019
+dygraph(ts_symphony,main="Historical Unit Sales of Subcategory Symphony in 2018 and 2019", xlab="Date", ylab="Unit Sales")
+```
+
+## Split Data into Train and Test
+
+### Grouping data into weeks
+```{r} 
+weeks_symphony=summarise(group_by(symphony,symphony$Week_End_Date),order_qty=sum(Order_Qty))
+sales_symphony = ts(data=weeks_symphony$order_qty,start = c(2018,1),end=c(2019,52),frequency = 52)
+sales_symphony
+```
+
+### 70% train, 30% test
+```{r}
+train_symphony=window(sales_symphony,end=c(2019,20))
+test_symphony=window(sales_symphony,start=c(2019,21))
+length(test_symphony)
+length(test_symphony)/length(sales_sonus)
+```
+
+## Fitting model to the training set
+
+```{r} 
+model_symphony_1 = auto.arima(y=train_symphony, stepwise = F, approximation = F, trace = T)
+model_symphony_1
+```
+
+## Obtain predicted values and accuracy
+
+```{r} 
+forecast_3=forecast(model_symphony_1,h=32) # forecasting on test
+accuracy(forecast_3,x=sales_symphony) # accuracy on train and test sets
+```
+
+## Plot predictions against known values
+
+```{r} 
+autoplot(sales_symphony, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_3, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast on Test Set ---- Symphony")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Train the model on the full data and forecast one year into the future
+
+```{r} 
+model_symphony_2 = auto.arima(y = sales_symphony, stepwise = F, approximation = F, trace = T)
+forecast_4=forecast(model_symphony_2,h=52) # forecasting one year into 2020
+```
+
+## Evaluate the Model using MSE and RMSE
+
+```{r} 
+accuracy(forecast_4) # accuracy on train set
+```
+
+## Plot the forecasted values alongside the original data
+
+```{r} 
+autoplot(sales_symphony, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_4, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast into 2020 ---- Symphony")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+# SureRide/Titan 65
+
+## Visualize the Historical Sales
+
+```{r,warning=FALSE} 
+days_sureride=summarise(group_by(sureride,sureride$Transaction_Date),order_qty=sum(Order_Qty))
+names(days_sureride)=c("Date","Order")
+
+ts_sureride = xts(days_sureride$Order, days_sureride$Date)
+# General Trend of Historical Sales in 2018 and 2019
+dygraph(ts_sureride,main="Historical Unit Sales of Subcategory Sureride in 2018 and 2019", xlab="Date", ylab="Unit Sales")
+```
+
+## Split Data into Train and Test
+
+### Grouping data into weeks
+```{r} 
+weeks_sureride=summarise(group_by(sureride,sureride$Week_End_Date),order_qty=sum(Order_Qty))
+sales_sureride = ts(data=weeks_sureride$order_qty,start = c(2018,1),end=c(2019,52),frequency = 52)
+sales_sureride
+```
+
+### 70% train, 30% test
+```{r}
+train_sureride=window(sales_sureride,end=c(2019,20))
+test_sureride=window(sales_sureride,start=c(2019,21))
+length(test_sureride)
+length(test_sureride)/length(sales_sureride)
+```
+
+## Fitting model to the training set
+
+```{r} 
+model_sureride_1 = auto.arima(y=train_sureride, stepwise = F, approximation = F, trace = T)
+model_sureride_1
+```
+
+## Obtain predicted values and accuracy
+
+```{r} 
+forecast_5=forecast(model_sureride_1,h=32) # forecasting on test
+accuracy(forecast_5,x=sales_sureride) # accuracy on train and test sets
+```
+
+## Plot predictions against known values
+
+```{r} 
+autoplot(sales_sureride, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_5, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast on Test Set ---- Sureride")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Train the model on the full data and forecast one year into the future
+
+```{r} 
+model_sureride_2 = auto.arima(y = sales_sureride, stepwise = F, approximation = F, trace = T)
+forecast_6=forecast(model_sureride_2,h=52) # forecasting one year into 2020
+```
+
+## Evaluate the Model using MSE and RMSE
+
+```{r} 
+accuracy(forecast_6) # accuracy on train set
+```
+
+## Plot the forecasted values alongside the original data
+
+```{r} 
+autoplot(sales_sureride, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_6, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast into 2020 ---- Sureride")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+# Pivot with SafeMax
+
+## Visualize the Historical Sales
+
+```{r,warning=FALSE} 
+days_pivot=summarise(group_by(pivot,pivot$Transaction_Date),order_qty=sum(Order_Qty))
+names(days_pivot)=c("Date","Order")
+
+ts_pivot = xts(days_pivot$Order, days_pivot$Date)
+# General Trend of Historical Sales in 2018 and 2019
+dygraph(ts_pivot,main="Historical Unit Sales of Subcategory Pivot with SafeMax in 2018 and 2019", xlab="Date", ylab="Unit Sales")
+```
+
+## Split Data into Train and Test
+
+### Grouping data into weeks
+```{r} 
+weeks_pivot=summarise(group_by(pivot,pivot$Week_End_Date),order_qty=sum(Order_Qty))
+#
+dates<-seq(from=as.Date("2018-1-6"), by=7, length.out=104)
+dates=data.frame(Week_End_Date=dates)
+names(weeks_pivot)=c("Week_End_Date","order_qty")
+weeks_pivot=left_join(dates,weeks_pivot,by="Week_End_Date")
+weeks_pivot[is.na(weeks_pivot)]=0 # imputing missing data with 0
+sales_pivot = ts(data=weeks_pivot$order_qty,start = c(2018,1),end=c(2019,52),frequency = 52)
+sales_pivot
+```
+
+### 70% train, 30% test
+```{r}
+train_pivot=window(sales_pivot,end=c(2019,20))
+test_pivot=window(sales_pivot,start=c(2019,21))
+length(test_pivot)
+length(test_pivot)/length(sales_pivot)
+```
+
+## Fitting model to the training set
+
+```{r} 
+model_pivot_1 = auto.arima(y=train_pivot, stepwise = F, approximation = F, trace = T)
+model_pivot_1
+```
+
+## Obtain predicted values and accuracy
+
+```{r} 
+forecast_7=forecast(model_pivot_1,h=32) # forecasting on test
+accuracy(forecast_7,x=sales_pivot) # accuracy on train and test sets
+```
+
+## Plot predictions against known values
+
+```{r} 
+autoplot(sales_pivot, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_7, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast on Test Set ---- Pivot with SafeMax")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+## Train the model on the full data and forecast one year into the future
+
+```{r} 
+model_pivot_2 = auto.arima(y = sales_pivot, stepwise = F, approximation = F, trace = T)
+forecast_8=forecast(model_pivot_2,h=52) # forecasting one year into 2020
+```
+
+## Evaluate the Model using MSE and RMSE
+
+```{r} 
+accuracy(forecast_8) # accuracy on train set
+```
+
+## Plot the forecasted values alongside the original data
+
+```{r} 
+autoplot(sales_pivot, size=1.05, color='#8abbd0',xlab = 'Timeline',ylab='Order Quantity')+
+    autolayer(forecast_8, size=1.05, color='#9ae5de',series='Auto-ARIMA model',PI=F)+
+    labs(title="ARIMA Model Forecast into 2020 ---- Pivot with SafeMax")+
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+
+
+
+
+
+
+
